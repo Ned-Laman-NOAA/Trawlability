@@ -8,6 +8,10 @@ smooth.gps.data <- function (gps.data, cross.180 = FALSE){
   # This program will create smoothed tow paths for the lines files 
   # necessary for Globe and for old tow paths plotted in ArcGIS
   #
+  # June 2020
+  # Rewritten to produce only decimal degree format output for Baker
+  # trawlability project
+  #
   ######################################################################
   
   smooth.gps.arc <- NA
@@ -39,8 +43,10 @@ smooth.gps.data <- function (gps.data, cross.180 = FALSE){
     smooth.gps.arc$longitude[smooth.gps.arc$longitude > 180] <- smooth.gps.arc$longitude[smooth.gps.arc$longitude > 180] - 360
   }
   
-  smooth.gps$latitude <- smooth.gps$latitude * pi/180
-  smooth.gps$longitude <- smooth.gps$longitude * pi/180
-  list(smooth.gps, smooth.gps.arc)
+  # smooth.gps$latitude <- smooth.gps$latitude * pi/180
+  # smooth.gps$longitude <- smooth.gps$longitude * pi/180
+  # list(smooth.gps, smooth.gps.arc)
+  
+  smooth.gps.arc
   
 }
