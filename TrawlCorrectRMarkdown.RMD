@@ -1,0 +1,268 @@
+---
+title: "CorrectedTrawlPosition"
+author: "Ned Laman"
+date: "6/11/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+options(digits = 9)
+require(RODBC)
+require(geosphere)
+require(shapefiles)
+require(maptools)
+require(rgdal)
+```
+
+## Correcting Trawl Position from Vessel Position, Bearing, and the Pythagorean Theorem
+
+This is written for Aleutian Islands summer bottom trawl survey data when the Poly Nor'Eastern net was in use (1991-2018). GPS data streams for this time period are stored in two schemae in Oracle: RACE_EDIT (1991-2004) and RACE_DATA (2006-present[2018]). Data streams (GPS positions) between On and Off Bottom events were extracted separately and stored in .csv's to maintain stability.
+
+
+
+```{r data, echo = FALSE}
+# Supply username and password to Oracle
+# afsc <- RODBC::odbcConnect(dsn = "AFSC", uid = rstudioapi::showPrompt(title = "Username", message = "Oracle Username", default = "lamane"), 
+#     pwd = rstudioapi::askForPassword("Enter Oracle Password"), believeNRows = FALSE)
+# get effort data from RACEBase.HAUL
+source("F:/Manuscripts/Baker_Trawlability/Functions/get.haul.data.R")
+RACEBase.HAUL.data <- get.AI.haul.data()
+head(RACEBase.HAUL.data)
+# these data were pre-queried, SQLPlus for them can be found @F:/Manuscripts/Baker_Trawlability/GettingPositionData.sql
+# uncorrected GPS stream data between On and Off Bottom events
+# will formalize get data functions in R using the SQLPlus for the record (update SQL to eliminate hauls w/no depth or wire out)
+RACE_DATA.towpaths <- read.csv("F:/Manuscripts/Baker_Trawlability/Uncorrected_RACEBase_Data/AI2006_2018_towpaths.csv", header = T)
+# RACE_DATA records have negative haul numbers when they are ported into RACEBase so changing sign here to match RACEBase extract above
+RACE_DATA.towpaths$hauljoin <- -RACE_DATA.towpaths$hauljoin
+RACE_EDIT.towpaths <- read.csv("F:/Manuscripts/Baker_Trawlability/Uncorrected_RACEBase_Data/AI1991_2004_towpaths.csv", header = T)
+
+# Combine towpath data from RACE_DATA and RACE_EDIT into a single data frame
+path.dat <- rbind(RACE_DATA.towpaths, RACE_EDIT.towpaths)
+head(path.dat)
+```
+
+Products of the trawl.correct() function will be GPS positions (points) of the trawl net behind the vessel computed from the vessel position and direction of travel. 
+Positions are corrected using Bearing and Distance Behind the Vessel determined from Bottom Depth and Wire Length using Pythagorean Theorem (assumes no catenary to the warp). To do this, we corrected each adjacent position pair from towpath segments using chronologically ordered position data along the path. Special considerations are that noise in the GPS data precludes the computation of towpath segments utilizing the bearing between adjacent points. When this was attempted the resulting data were garbage, bearings ranging around the compass from 0 - 359. Therefore, we used a rhumb line approach (path with constant bearing) by computing the bearing between start and end points for the linear tow and applying that fixed bearing to the path segments when correcting each position behind the vessel.
+
+
+```{r trawl correct, eval=FALSE, include=FALSE}
+
+trawl.correct <- function(){
+
+    # this function will produce corrected On/Off Bottom positions for straight line towpaths corrected for trawl position behind vessel
+    # and will produce corrected positions along the towpath between On/Off Bottom positions, saving both as separate csvs "linepath" and "towpath" named
+    
+    require(RODBC)
+    require(geosphere)
+    
+    options(digits = 9)
+    
+    # Supply username and password to Oracle 
+    afsc <- odbcConnect(dsn = "AFSC", uid = rstudioapi::showPrompt(title = "Username", message = "Oracle Username", default = "lamane"), 
+    pwd = rstudioapi::askForPassword("Enter Oracle Password"), believeNRows = FALSE)
+    
+    # get data from Oracle
+    RACEBase.HAUL.data <- get.haul.data(afsc)
+    haul.dat <- RACEBase.HAUL.data
+    
+    # head(RACEBase.HAUL.data)
+    
+    print("Getting towpaths from RACE_DATA and RACE_EDIT...")
+    ################## consider changing this to an Oracle data call
+    # these data were pre-queried, SQLPlus can be found @F:/Manuscripts/Baker_Trawlability/GettingPositionData.sql
+    RACE_DATA.towpaths <- read.csv("C:/Users/ned.laman/Desktop/Baker Products/AI2006_2018_towpaths.csv", header = T)
+    # RACE_DATA records have negative haul numbers when they are ported into RACEBase
+    RACE_DATA.towpaths$hauljoin <- -RACE_DATA.towpaths$hauljoin
+    RACE_EDIT.towpaths <- read.csv("C:/Users/ned.laman/Desktop/Baker Products/AI1991_2004_towpaths.csv", header = T)
+    
+    # Combine towpath data from RACE_DATA and RACE_EDIT into a single data frame
+    path.dat <- rbind(RACE_DATA.towpaths, RACE_EDIT.towpaths)
+    
+    close(afsc)
+    
+    ####################### for testing ############################
+    # haul.dat <- haul.dat[haul.dat$hauljoin %in% c(-18060, -16079), ]
+    # path.dat <- path.dat[path.dat$hauljoin %in% c(-18060, -16079), ]
+    
+    
+    # create null data frames to accept appended rows from from loops below
+    corrected.obfb <- data.frame(hauljoin = numeric(), c_start_lon = numeric(), c_start_lat = numeric(), c_end_lon = numeric(), c_end_lat = numeric(), stringsAsFactors = FALSE)
+    hj.names <- names(corrected.obfb)
+    
+    corrected.position <- data.frame(hauljoin = numeric(), c_lon_1 = numeric(), c_lat_1 = numeric(), c_lon_2 = numeric(), c_lat_2 = numeric(), stringsAsFactors = FALSE)
+    col.names <- names(corrected.position)
+    
+    print("Correcting GPS data for position of net behind vessel...")
+    
+    for(hj in ╬$hauljoin){
+    
+        # this outer loop will correct linear towpath
+        
+        ## subset by hauljoin
+        hj.dat <- haul.dat[haul.dat$hauljoin == hj, ]
+        pos.dat <- path.dat[path.dat$hauljoin == hj, ]
+        
+        # limit to hauls with at least 100 positions
+        # this should only eliminate around 20 hauls based on pre-screen
+        if(length(pos.dat$hauljoin) < 100){next}
+        
+        # what if there's position data but no haul?
+        if(unique(pos.dat$hauljoin) != hj.dat$hauljoin){next}
+        
+        # compute bearing between positions, accepts data in decimal degrees
+        B <- geosphere::bearing(c(hj.dat$end_longitude, hj.dat$end_latitude), c(hj.dat$start_longitude, hj.dat$start_latitude))
+        
+        # call position.correction function
+        haul.vec <- position.correction(hj = hj.dat$hauljoin, start.lon = hj.dat$start_longitude, start.lat = hj.dat$start_latitude, 
+            end.lon = hj.dat$end_longitude, end.lat = hj.dat$end_latitude, bearing = B, depth = hj.dat$bottom_depth, wire_out = hj.dat$wire_length)
+        ## Haul-specific parameters
+        
+        corrected.obfb <- rbind(corrected.obfb, haul.vec)
+        
+        print(paste0("Correcting towpath for hauljoin ", hj, "..."))
+        
+        i = 2
+        
+        for(i in 2:(length(pos.dat$hauljoin))){
+        
+            # index is built to compare the second position to the previous position so direction of travel is in line with vessel travel
+            start.lat <- pos.dat$latitude[i]
+            start.lon <- pos.dat$longitude[i]
+            end.lat <- pos.dat$latitude[i-1]
+            end.lon <- pos.dat$longitude[i-1]
+            
+            ## create vector of corrected position identified by hauljoin
+            pos.vec <- position.correction(hj, start.lon = start.lon, start.lat = start.lat, end.lon = end.lon, end.lat = end.lat, bearing = B,
+                depth = hj.dat$bottom_depth, wire_out = hj.dat$wire_length)
+            
+            ## append corrected positions to results data frame
+            corrected.position <- rbind(corrected.position, pos.vec)
+            
+            }
+        }
+    
+    # instead of looping this as above, could simply grab data and correct in mass one column vector at a time?
+    # if I did this how would I represent the direction of travel from position i+1 to position i?
+    
+    ## apply field names to results data frame
+    names(corrected.position) <- col.names
+    names(corrected.obfb) <- hj.names
+    
+    ## merge original and corrected positions into single data frame
+    # print("Merging raw and correct position data...")
+    # new.haul.dat <- merge(path.dat, corrected.position)
+    
+    print("Writing csvs...")
+    write.csv(corrected.position, "C:/Users/ned.laman/Desktop/Baker Products/AI1991_2018_towpaths_corrected.csv", row.names = F)
+    write.csv(corrected.obfb, "C:/Users/ned.laman/Desktop/Baker Products/AI1991_2018_linepaths_corrected.csv", row.names = F)
+
+    # write.csv(corrected.position, "F:/Manuscripts/Baker_Trawlability/Corrected Position Data/AI1991_2018_towpaths_corrected.csv", row.names = F)
+    # write.csv(corrected.obfb, "F:/Manuscripts/Baker_Trawlability/Corrected Position Data/AI1991_2018_linepaths_corrected.csv", row.names = F)
+    
+    }
+
+
+trawl.correct()
+
+haul.dat <- read.csv()
+path.dat <- read.csv()
+head(haul.dat)
+head(path.dat)
+```
+
+Products:
+1) Position-corrected start and end points corresponding to On and Off Bottom events;
+2) Position-corrected points along the towpath between On and Off bottom events;
+3) CSVs for each of the point data types in items 1) & 2) above.
+
+```{r convert.points.to.path, echo = FALSE}
+# convert points into lines for ArcMap
+
+# get data
+path.dat <- read.csv("F:/Manuscripts/Baker_Trawlability/Corrected Position Data/AI1991_2018_towpaths_corrected.csv", header = T)
+# identify destination
+output.arcgis.paths.file <- "F:/Manuscripts/Baker_Trawlability/towpaths"
+
+# frame data
+# the data coming in from the CSV contain both adjacent points are pairs, I'm using just the first position of each pair
+arcgis.shp <- data.frame(Id = path.dat$hauljoin, X = path.dat$c_lon_1, Y = path.dat$c_lat_1)
+# eliminate NAs
+arcgis.shp <- arcgis.shp[!is.na(arcgis.shp$Id),] # a data frame with 3 variables (Id, X, Y)
+# just need column of unique hauljoins here 
+arcgis.dbf <- data.frame(Id = unique(path.dat$hauljoin))
+
+# old school method for creating the towpaths
+# maptools::readShapeLines is deprecated
+# first convert points to shapefile	where type 3 means polyLine
+arcgis.shapefile <- shapefiles::convert.to.shapefile(shpTable = arcgis.shp, attTable = arcgis.dbf, field = "Id", type = 3)
+# write shapefile which, give it the filename in out.name, and arcgis = T replaces "." with "\_" in column names for ArcGIS
+shapefiles::write.shapefile(shapefile = arcgis.shapefile, out.name = paste0(output.arcgis.paths.file, "/tpath"), arcgis = T)
+# DEPRECATED writes shapefile at end of path, but really doesn't...I think it makes a memory object accessible in the next step
+# arcgis.shapefile <- maptools::readShapeLines(output.arcgis.paths.file, proj4string=CRS("+proj=longlat +datum=NAD83"))
+
+# reads shapefile named above and assigns projection (P4)
+rgdal.shp <- rgdal::readOGR(dsn = output.arcgis.paths.file, layer = "tpath", p4s = "+proj=longlat +datum=NAD83")
+# re-writes shapefile using ESRI driver, includes projection, overwrites anything same named at the end of the path
+rgdal::writeOGR(rgdal.shp, output.arcgis.paths.file, "new_towpaths", driver = "ESRI Shapefile", overwrite_layer = TRUE)
+
+# note that when charting the corrected positions the corrected towpath looks like it is in front of the vessel positions
+# the phenomenon is actually that the vessel starts at a point but has to travel the distance the net is set behind the vessel 
+# before arriving at the corrected position where the net touched down at on bottom
+```
+
+Corrected positions devolving from the trawl.correct() function need to be smoothed to make a less jagged path. We use the smooth.gps.data() function from the tow.path.oracle.globe software used to make chart products for the survey (F:\AI_GOA\R\tow path).
+
+```{r smooth gps path, echo = FALSE}
+smooth.gps.data <- function (gps.data, cross.180 = FALSE){
+  
+  #######################  smooth.gps.data  ############################
+  #
+  # N. Laman
+  # March 2015
+  #
+  # This program will create smoothed tow paths for the lines files 
+  # necessary for Globe and for old tow paths plotted in ArcGIS
+  #
+  ######################################################################
+  
+  smooth.gps.arc <- NA
+  
+  if(any(sign(gps.data$longitude)!=sign(gps.data$longitude[1]))){
+    gps.data$longitude[sign(gps.data$longitude) == -1] <- 180 + (180 - abs(gps.data$longitude[sign(gps.data$longitude) == -1]))
+    cat("Tow crosses 180 degrees.\n")
+    cross.180 <- TRUE
+  }
+  
+  ## I changed the original kts definition because it was failing because there were too many knots
+  # kts = round(length(gps.data$date_time)/5,0)
+  if(length(gps.data$date_time) <= 1){
+    next
+  }else{
+    kts <- ifelse(length(gps.data$date_time) >= 2 & length(gps.data$date_time) < 10, 2, 10)
+  }
+  
+  lat.spline <- smooth.spline(as.numeric(difftime(gps.data$date_time, gps.data$date_time[1])), gps.data$latitude, all.knots = FALSE, nknots = kts)
+  long.spline <- smooth.spline(as.numeric(difftime(gps.data$date_time, gps.data$date_time[1])), gps.data$longitude, all.knots = FALSE, 
+                               nknots = kts)
+  smooth.lat <- predict(lat.spline, as.numeric(difftime(gps.data$date_time, gps.data$date_time[1], units = "secs")))$y
+  smooth.long <- predict(long.spline, as.numeric(difftime(gps.data$date_time, gps.data$date_time[1], units = "secs")))$y
+  smooth.gps <- data.frame(gps.data$date_time, smooth.lat, smooth.long)
+  names(smooth.gps) <- c("date_time", "latitude", "longitude")
+  smooth.gps.arc <- smooth.gps
+  
+  if(cross.180){
+    smooth.gps.arc$longitude[smooth.gps.arc$longitude > 180] <- smooth.gps.arc$longitude[smooth.gps.arc$longitude > 180] - 360
+  }
+  
+  smooth.gps$latitude <- smooth.gps$latitude * pi/180
+  smooth.gps$longitude <- smooth.gps$longitude * pi/180
+  list(smooth.gps, smooth.gps.arc)
+  
+}
+
+smooth.gps.data()
+
+```
+
+**Fine!**
